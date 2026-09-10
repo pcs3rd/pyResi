@@ -1,12 +1,11 @@
 [project]
-name = "hello-world"
+name = "pyResi"
 version = "0.1.0"
-description = "Add your description here"
+description = "Unofficial Python client for the Resi Central API (studio.resi.io) — encoders, channels, events, and cue markers."
 requires-python = ">=3.14"
-dependencies = [ ]
-
-[project.scripts]
-hello = "hello_world:hello"
+dependencies = [
+ "requests>=2.34.2",
+]
 
 [build-system]
 requires = ["uv_build>=0.9.0,<0.10.0"]

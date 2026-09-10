@@ -1,0 +1,133 @@
+import json
+import time
+import uuid
+from pathlib import Path
+from requests import Session
+
+
+# ---------- Base class, handle authentication ----------
+class pyResi:
+    API_URL = 'https://central.resi.io'
+    SESSION_FILE = Path.home() / '.pyresi_session.json'
+
+    def __init__(self, username=None, password=None, token=None):
+        self.session = Session()
+        self.username = username
+        self.password = password
+        self.token = token
+        self.token_expires_at = 0
+        self.customer_id = None
+
+        if self.token is not None:
+            # Caller handed us a token directly — trust it, skip everything else.
+            self._apply_token(self.token)
+            return
+
+        # 1) Try picking up a still-valid session from disk first.
+        if self._load_saved_session():
+            return
+
+        # 2) Nothing usable saved — do a full login.
+        self._login(username, password)
+        self._save_session()
+
+    # ---------- auth ----------
+
+    def _login(self, username, password):
+        login_resp = self.session.post(
+            f'{self.API_URL}/api/v3/login?newToken=true',
+            json={'userName': str(username), 'password': str(password)},
+        )
+        login_resp.raise_for_status()
+
+        token_resp = self.session.post(
+            f'{self.API_URL}/api/v3/auth/token',
+            json={
+                'username': str(username),
+                'password': str(password),
+                'grant_type': 'password_cookie',
+            },
+        )
+        token_resp.raise_for_status()
+        self._store_token_response(token_resp.json())
+
+    def _refresh(self):
+        """Silent reauth using only the refreshToken cookie — no password needed."""
+        token_resp = self.session.post(
+            f'{self.API_URL}/api/v3/auth/token',
+            json={'grant_type': 'refresh_token_cookie'},
+        )
+        token_resp.raise_for_status()
+        self._store_token_response(token_resp.json())
+
+    def ensure_authenticated(self):
+        """Call this before any API request — refreshes or re-logs-in as needed."""
+        if time.time() < self.token_expires_at - 30:  # 30s safety margin
+            return
+        try:
+            self._refresh()
+        except Exception:
+            if not (self.username and self.password):
+                raise RuntimeError('Token expired and no credentials available to reauth')
+            self._login(self.username, self.password)
+        self._save_session()
+
+    def _store_token_response(self, data):
+        token = data.get('access_token') or data.get('accessToken')
+        if not token:
+            raise ValueError('Failed to obtain a Resi access token')
+        expires_in = data.get('expires_in') or data.get('expiresIn') or 3600
+        self.token_expires_at = time.time() + expires_in
+        self._apply_token(token)
+
+    def _apply_token(self, token):
+        self.token = token
+        self.session.headers.update({
+            'Authorization': f'X-Bearer {token}',
+            'Accept': 'application/json',
+        })
+
+    # ---------- persistence across invocations ----------
+
+    def _save_session(self):
+        data = {
+            'token': self.token,
+            'expires_at': self.token_expires_at,
+            'cookies': self.session.cookies.get_dict(),
+        }
+        self.SESSION_FILE.write_text(json.dumps(data))
+
+    def _load_saved_session(self):
+        if not self.SESSION_FILE.exists():
+            return False
+        try:
+            data = json.loads(self.SESSION_FILE.read_text())
+            self.session.cookies.update(data.get('cookies', {}))
+            self.token_expires_at = data.get('expires_at', 0)
+            saved_token = data.get('token')
+            if not saved_token:
+                return False
+            self._apply_token(saved_token)
+            self.ensure_authenticated()  # refreshes if expired, using the cookie
+            return True
+        except Exception:
+            return False
+
+    # ---------- authenticated requests ----------
+
+    def get(self, path, **kwargs):
+        self.ensure_authenticated()
+        return self.session.get(f'{self.API_URL}{path}', **kwargs)
+
+    def post(self, path, **kwargs):
+        self.ensure_authenticated()
+        headers = {'trackingid': f'STUDIO_{uuid.uuid4()}'}
+        headers['x-request-id'] = headers['trackingid']
+        kwargs.setdefault('headers', {}).update(headers)
+        return self.session.post(f'{self.API_URL}{path}', **kwargs)
+
+# ---------- Encoder Helpers ---------- 
+class _Encoders:
+    def __init__(self, client):
+        self._client = client
+        def
