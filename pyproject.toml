@@ -1,6 +1,6 @@
 [project]
 name = "pyResi"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unofficial Python client for the Resi Central API (studio.resi.io) — encoders, channels, events, and cue markers."
 requires-python = ">=3.14"
 dependencies = [

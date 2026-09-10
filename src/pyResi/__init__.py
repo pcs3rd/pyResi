@@ -13,8 +13,10 @@ been seen working against a real account.
 import json
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import requests
 from requests import Session
 
 
@@ -47,6 +49,100 @@ def _ensure_https(url):
     if url and url.startswith('//'):
         return f'https:{url}'
     return url
+
+
+def seconds_to_position(seconds):
+    """Format a duration in seconds as a Resi cue position string
+    (H:MM:SS.mmm — zero-padded except the leading hours field)."""
+    if seconds < 0:
+        raise ValueError('position cannot be negative')
+    total_ms = round(seconds * 1000)
+    ms = total_ms % 1000
+    total_s = total_ms // 1000
+    s = total_s % 60
+    total_m = total_s // 60
+    m = total_m % 60
+    h = total_m // 60
+    return f'{h}:{m:02d}:{s:02d}.{ms:03d}'
+
+
+def position_to_seconds(position):
+    """Parse a Resi cue position string (H:MM:SS.mmm) back to seconds."""
+    h, m, rest = position.split(':')
+    s, ms = rest.split('.')
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
+
+
+def event_start_time(event):
+    raw = event.get('startTime')
+    if not raw:
+        return None
+    value = raw[:-1] + '+00:00' if raw.endswith('Z') else raw
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_manifest(text):
+    """Minimal HLS media playlist parser — just enough to walk segments in
+    order and pick up any EXT-X-PROGRAM-DATE-TIME tag attached to one. Not a
+    general-purpose HLS parser (ignores variant playlists, tags other than
+    EXTINF/PROGRAM-DATE-TIME, etc.) — just what streaming_delay() needs.
+
+    Returns a list of {'duration': float, 'uri': str, 'program_date_time':
+    datetime | None} in playlist order.
+    """
+    segments = []
+    pending_pdt = None
+    pending_duration = 0.0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith('#EXT-X-PROGRAM-DATE-TIME:'):
+            value = line.split(':', 1)[1]
+            pdt = datetime.fromisoformat(value)
+            if pdt.tzinfo is None:
+                pdt = pdt.replace(tzinfo=timezone.utc)
+            pending_pdt = pdt.astimezone(timezone.utc)
+        elif line.startswith('#EXTINF:'):
+            value = line[len('#EXTINF:'):].split(',', 1)[0]
+            try:
+                pending_duration = float(value)
+            except ValueError:
+                pending_duration = 0.0
+        elif not line.startswith('#'):
+            # A bare, non-comment line after EXTINF is the segment URI —
+            # closes out whatever's pending into one segment.
+            segments.append({
+                'duration': pending_duration,
+                'uri': line,
+                'program_date_time': pending_pdt,
+            })
+            pending_pdt = None
+            pending_duration = 0.0
+    return segments
+
+
+def _live_edge_time(segments, fallback_start=None):
+    """The absolute UTC time at the end of the last segment — the boundary
+    between what's actually been encoded and what hasn't yet.
+
+    Walks segments in order, resetting to each one's own
+    EXT-X-PROGRAM-DATE-TIME when present and otherwise accumulating
+    durations from `fallback_start` (or the last known PDT). Handles both a
+    manifest that tags every segment and one that only tags the first —
+    unconfirmed which (if either) Resi's manifests actually do. Returns
+    None if there's nothing to anchor to at all.
+    """
+    current = fallback_start
+    for seg in segments:
+        if seg['program_date_time'] is not None:
+            current = seg['program_date_time']
+        if current is not None:
+            current = current + timedelta(seconds=seg['duration'])
+    return current
 
 
 # ---------- Base class, handles authentication ----------
@@ -309,6 +405,54 @@ class _Events:
     def dash_url(event):
         """event['cloudUrl'] (DASH manifest, same content as the HLS one), normalized."""
         return _ensure_https(event.get('cloudUrl'))
+
+    def fetch_manifest(self, event):
+        """GET the event's HLS manifest straight from the resi.media CDN.
+        Deliberately not routed through the authenticated client — the API
+        doc notes there's no auth token in these URLs, so this is a plain,
+        unauthenticated request rather than leaking the account's bearer
+        token to a third-party CDN host that doesn't need it."""
+        url = self.hls_url(event)
+        if not url:
+            raise ValueError('event has no hlsUrl to fetch')
+        resp = requests.get(url, timeout=10)
+        _raise_for_status(resp)
+        return resp.text
+
+    def live_edge_time(self, event):
+        """The absolute UTC time of the most recently encoded content for a
+        live event — i.e. how far the manifest actually extends right now.
+
+        Uses EXT-X-PROGRAM-DATE-TIME tags in the manifest when present;
+        falls back to event['startTime'] plus the sum of segment durations
+        seen so far when they're absent (whether Resi's manifests carry PDT
+        tags at all is unconfirmed — this covers either case). Returns None
+        if neither is available (e.g. an empty manifest).
+        """
+        segments = _parse_manifest(self.fetch_manifest(event))
+        if not segments:
+            return None
+        return _live_edge_time(segments, fallback_start=event_start_time(event))
+
+    def streaming_delay(self, event):
+        """Seconds by which Resi's actually-encoded content lags real time,
+        for a currently-live event — i.e. how far behind "live" whatever
+        you're watching on a Resi player actually is right now.
+
+        Use this to correct a real-world timestamp before turning it into a
+        cue position: if an operator reacts to something they just saw on a
+        delayed player, the real-world moment they're marking happened
+        `streaming_delay(event)` seconds before they reacted, not at the
+        instant they reacted.
+
+        Returns 0.0 if the live edge can't be determined (no segments yet,
+        or a finished/VOD event, where "behind live" isn't meaningful).
+        """
+        edge = self.live_edge_time(event)
+        if edge is None:
+            return 0.0
+        delay = (datetime.now(timezone.utc) - edge).total_seconds()
+        return max(0.0, delay)
 
 
 # ---------- Cues ----------
