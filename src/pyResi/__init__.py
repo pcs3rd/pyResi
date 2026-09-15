@@ -15,6 +15,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
 from requests import Session
@@ -81,15 +82,22 @@ def position_to_seconds(position):
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000
 
 
-def event_start_time(event):
-    raw = event.get('startTime')
-    if not raw:
-        return None
+def _parse_iso8601(raw):
+    """datetime.fromisoformat, but tolerant of a trailing 'Z' (UTC) — only
+    accepted natively from Python 3.11 onward, and both Resi's event
+    timestamps and its HLS manifests' EXT-X-PROGRAM-DATE-TIME tags use it."""
     value = raw[:-1] + '+00:00' if raw.endswith('Z') else raw
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def event_start_time(event):
+    raw = event.get('startTime')
+    if not raw:
+        return None
+    return _parse_iso8601(raw)
 
 
 def _parse_manifest(text):
@@ -110,10 +118,7 @@ def _parse_manifest(text):
             continue
         if line.startswith('#EXT-X-PROGRAM-DATE-TIME:'):
             value = line.split(':', 1)[1]
-            pdt = datetime.fromisoformat(value)
-            if pdt.tzinfo is None:
-                pdt = pdt.replace(tzinfo=timezone.utc)
-            pending_pdt = pdt.astimezone(timezone.utc)
+            pending_pdt = _parse_iso8601(value)
         elif line.startswith('#EXTINF:'):
             value = line[len('#EXTINF:'):].split(',', 1)[0]
             try:
@@ -151,6 +156,38 @@ def _live_edge_time(segments, fallback_start=None):
         if current is not None:
             current = current + timedelta(seconds=seg['duration'])
     return current
+
+
+def _is_master_playlist(text):
+    """True if this manifest text is an HLS master/variant playlist (lists
+    renditions via EXT-X-STREAM-INF, with no real media segments of its
+    own) rather than a media playlist that actually carries segments.
+
+    A Resi event's hlsUrl points at a master playlist — it has to be
+    followed to one of its variants to get anything with EXTINF/
+    EXT-X-PROGRAM-DATE-TIME tags in it. Confirmed against a real event's
+    manifest: the master is a ~342-byte file with a single EXT-X-STREAM-INF
+    line and a bare variant URI (e.g. "Manifest_0_0.m3u8"), which
+    _parse_manifest would otherwise misread as one zero-duration,
+    untimed segment.
+    """
+    return '#EXT-X-STREAM-INF' in text
+
+
+def _first_variant_uri(text):
+    """The URI of the first variant in a master playlist — the first
+    non-comment, non-blank line following an EXT-X-STREAM-INF tag."""
+    lines = text.splitlines()
+    for i, raw_line in enumerate(lines):
+        if raw_line.strip().startswith('#EXT-X-STREAM-INF'):
+            for candidate in lines[i + 1:]:
+                candidate = candidate.strip()
+                if not candidate:
+                    continue
+                if candidate.startswith('#'):
+                    continue
+                return candidate
+    return None
 
 
 # ---------- Base class, handles authentication ----------
@@ -415,17 +452,36 @@ class _Events:
         return _ensure_https(event.get('cloudUrl'))
 
     def fetch_manifest(self, event):
-        """GET the event's HLS manifest straight from the resi.media CDN.
-        Deliberately not routed through the authenticated client — the API
-        doc notes there's no auth token in these URLs, so this is a plain,
-        unauthenticated request rather than leaking the account's bearer
-        token to a third-party CDN host that doesn't need it."""
+        """GET the event's real media playlist (the one with actual
+        segments) from the resi.media CDN.
+
+        event['hlsUrl'] itself is a master/variant playlist — it lists
+        renditions (EXT-X-STREAM-INF) but carries no EXTINF segments or
+        EXT-X-PROGRAM-DATE-TIME tags of its own. When that's what comes
+        back, this follows the first variant's URI (resolved relative to
+        the master playlist's own URL, e.g. "Manifest_0_0.m3u8" relative
+        to ".../Manifest.m3u8") and returns THAT manifest instead, since
+        that's the one with content live_edge_time() can actually use.
+
+        Deliberately not routed through the authenticated client for either
+        fetch — the API doc notes there's no auth token in these URLs, so
+        these are plain, unauthenticated requests rather than leaking the
+        account's bearer token to a third-party CDN host that doesn't need
+        it."""
         url = self.hls_url(event)
         if not url:
             raise ValueError('event has no hlsUrl to fetch')
         resp = requests.get(url, timeout=10)
         _raise_for_status(resp)
-        return resp.text
+        text = resp.text
+        if _is_master_playlist(text):
+            variant_uri = _first_variant_uri(text)
+            if variant_uri:
+                media_url = urljoin(url, variant_uri)
+                media_resp = requests.get(media_url, timeout=10)
+                _raise_for_status(media_resp)
+                text = media_resp.text
+        return text
 
     def live_edge_time(self, event):
         """The absolute UTC time of the most recently encoded content for a
