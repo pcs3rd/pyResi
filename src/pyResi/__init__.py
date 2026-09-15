@@ -53,7 +53,15 @@ def _ensure_https(url):
 
 def seconds_to_position(seconds):
     """Format a duration in seconds as a Resi cue position string
-    (H:MM:SS.mmm — zero-padded except the leading hours field)."""
+    (HH:MM:SS.mmm, hours zero-padded to at least 2 digits).
+
+    Every captured-verbatim POST/PATCH cue body in the API reference uses a
+    2-digit hour ("00:00:00.000", "00:00:11.000") — a single-digit hour
+    ("0:00:30.000") triggers a 400 from the cue-creation endpoint, wrapped
+    by Resi's gateway as a 503 ("Post cue request has returned with an
+    unexpected response: 400"). Reading cues back is unaffected either way
+    since position_to_seconds() parses both forms identically.
+    """
     if seconds < 0:
         raise ValueError('position cannot be negative')
     total_ms = round(seconds * 1000)
@@ -63,7 +71,7 @@ def seconds_to_position(seconds):
     total_m = total_s // 60
     m = total_m % 60
     h = total_m // 60
-    return f'{h}:{m:02d}:{s:02d}.{ms:03d}'
+    return f'{h:02d}:{m:02d}:{s:02d}.{ms:03d}'
 
 
 def position_to_seconds(position):
