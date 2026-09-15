@@ -102,21 +102,30 @@ def event_start_time(event):
 
 def _parse_manifest(text):
     """Minimal HLS media playlist parser — just enough to walk segments in
-    order and pick up any EXT-X-PROGRAM-DATE-TIME tag attached to one. Not a
-    general-purpose HLS parser (ignores variant playlists, tags other than
-    EXTINF/PROGRAM-DATE-TIME, etc.) — just what streaming_delay() needs.
+    order, pick up any EXT-X-PROGRAM-DATE-TIME tag attached to one, and
+    read the playlist's target segment duration. Not a general-purpose HLS
+    parser (ignores variant playlists, tags other than EXTINF/PROGRAM-
+    DATE-TIME/TARGETDURATION, etc.) — just what streaming_delay() and
+    decoder_buffer_delay() need.
 
-    Returns a list of {'duration': float, 'uri': str, 'program_date_time':
-    datetime | None} in playlist order.
+    Returns {'segments': [{'duration': float, 'uri': str,
+    'program_date_time': datetime | None}, ...] in playlist order,
+    'target_duration': float | None}.
     """
     segments = []
+    target_duration = None
     pending_pdt = None
     pending_duration = 0.0
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith('#EXT-X-PROGRAM-DATE-TIME:'):
+        if line.startswith('#EXT-X-TARGETDURATION:'):
+            try:
+                target_duration = float(line.split(':', 1)[1])
+            except ValueError:
+                target_duration = None
+        elif line.startswith('#EXT-X-PROGRAM-DATE-TIME:'):
             value = line.split(':', 1)[1]
             pending_pdt = _parse_iso8601(value)
         elif line.startswith('#EXTINF:'):
@@ -135,7 +144,7 @@ def _parse_manifest(text):
             })
             pending_pdt = None
             pending_duration = 0.0
-    return segments
+    return {'segments': segments, 'target_duration': target_duration}
 
 
 def _live_edge_time(segments, fallback_start=None):
@@ -493,21 +502,24 @@ class _Events:
         tags at all is unconfirmed — this covers either case). Returns None
         if neither is available (e.g. an empty manifest).
         """
-        segments = _parse_manifest(self.fetch_manifest(event))
+        parsed = _parse_manifest(self.fetch_manifest(event))
+        segments = parsed['segments']
         if not segments:
             return None
         return _live_edge_time(segments, fallback_start=event_start_time(event))
 
     def streaming_delay(self, event):
         """Seconds by which Resi's actually-encoded content lags real time,
-        for a currently-live event — i.e. how far behind "live" whatever
-        you're watching on a Resi player actually is right now.
+        for a currently-live event — i.e. how far behind "live" the
+        manifest itself is right now. This is encoder/CDN lag only — it
+        does NOT include a downstream decoder's own playback buffering (see
+        decoder_buffer_delay()).
 
         Use this to correct a real-world timestamp before turning it into a
         cue position: if an operator reacts to something they just saw on a
-        delayed player, the real-world moment they're marking happened
-        `streaming_delay(event)` seconds before they reacted, not at the
-        instant they reacted.
+        delayed player, the real-world moment they're marking happened at
+        least `streaming_delay(event)` seconds before they reacted, not at
+        the instant they reacted.
 
         Returns 0.0 if the live edge can't be determined (no segments yet,
         or a finished/VOD event, where "behind live" isn't meaningful).
@@ -517,6 +529,43 @@ class _Events:
             return 0.0
         delay = (datetime.now(timezone.utc) - edge).total_seconds()
         return max(0.0, delay)
+
+    def decoder_buffer_delay(self, event, buffer_segments=3):
+        """Estimated extra seconds a downstream HLS decoder holds content
+        before actually rendering it, on top of streaming_delay()'s
+        encoder/CDN lag.
+
+        Live HLS players (including hardware decoders) don't start playback
+        at the manifest's live edge — they hold back a few segments first
+        as a stall-avoidance buffer, commonly ~3x the playlist's
+        EXT-X-TARGETDURATION (a widely-used default; Resi's own decoders
+        aren't documented, so this is a reasonable estimate rather than a
+        confirmed constant). Derived from the manifest itself so it tracks
+        whatever segment duration the event is actually using, rather than
+        a hardcoded number of seconds.
+
+        Returns 0.0 if the manifest has no EXT-X-TARGETDURATION to derive
+        from (e.g. a master playlist with no reachable variant, or a
+        finished/VOD event).
+        """
+        parsed = _parse_manifest(self.fetch_manifest(event))
+        target_duration = parsed['target_duration']
+        if not target_duration:
+            return 0.0
+        return buffer_segments * target_duration
+
+    def total_delay(self, event, buffer_segments=3):
+        """streaming_delay() + decoder_buffer_delay() — the full real-world
+        lag between something entering the encoder and it actually becoming
+        visible on a downstream decoder, for correcting a cue's position
+        against what an operator sees on a live monitor.
+
+        Fetches the manifest twice (once per component) rather than
+        threading a shared fetch through both — cue creation is a rare,
+        human-triggered event, not a hot path, so the simplicity is worth
+        the extra request.
+        """
+        return self.streaming_delay(event) + self.decoder_buffer_delay(event, buffer_segments)
 
 
 # ---------- Cues ----------
